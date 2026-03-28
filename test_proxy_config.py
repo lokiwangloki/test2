@@ -103,6 +103,34 @@ class ProxyNormalizationTests(unittest.TestCase):
         workflow = Path(".github/workflows/scheduler.yml").read_text(encoding="utf-8")
         self.assertIn("Diagnose CPA DNS", workflow)
 
+    def test_mailbox_service_factory_supports_lamail_and_tempmail_only(self):
+        fake_register = object()
+        self.assertIsInstance(
+            ncs_register._build_mailbox_service(fake_register, "lamail"),
+            ncs_register.LaMailMailboxService,
+        )
+        self.assertIsInstance(
+            ncs_register._build_mailbox_service(fake_register, "tempmail_lol"),
+            ncs_register.TempmailLolMailboxService,
+        )
+        with self.assertRaises(ValueError):
+            ncs_register._build_mailbox_service(fake_register, "duckmail")
+
+    def test_load_config_supports_batch_runtime_defaults(self):
+        fake_config = {
+            "batch_mode": "pipeline",
+            "task_launch_interval_min_seconds": 2,
+            "task_launch_interval_max_seconds": 5,
+        }
+        with mock.patch("ncs_register.os.path.exists", return_value=True):
+            with mock.patch("builtins.open", mock.mock_open(read_data="{}")):
+                with mock.patch("ncs_register.json.load", return_value=fake_config):
+                    config = ncs_register._load_config()
+
+        self.assertEqual(config["batch_mode"], "pipeline")
+        self.assertEqual(config["task_launch_interval_min_seconds"], 2)
+        self.assertEqual(config["task_launch_interval_max_seconds"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

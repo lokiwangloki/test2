@@ -19,10 +19,10 @@ import traceback
 import secrets
 import hashlib
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, parse_qs, urlencode
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from curl_cffi import requests as curl_requests
 from config_env import env_override
@@ -78,6 +78,9 @@ def _load_config():
         "upload_api_proxy": "",
         "cpa_cleanup_enabled": True,
         "cpa_upload_every_n": 3,
+        "batch_mode": "pipeline",
+        "task_launch_interval_min_seconds": 1,
+        "task_launch_interval_max_seconds": 3,
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -113,6 +116,9 @@ def _load_config():
         "cfmail_config_path": "CFMAIL_CONFIG_PATH",
         "cfmail_profile": "CFMAIL_PROFILE",
         "cpa_upload_every_n": "CPA_UPLOAD_EVERY_N",
+        "batch_mode": "BATCH_MODE",
+        "task_launch_interval_min_seconds": "TASK_LAUNCH_INTERVAL_MIN_SECONDS",
+        "task_launch_interval_max_seconds": "TASK_LAUNCH_INTERVAL_MAX_SECONDS",
     }
     for key, default_env_name in env_mappings.items():
         env_value = env_override(config, key, default_env_name)
@@ -122,6 +128,11 @@ def _load_config():
     config["proxy"] = _normalize_proxy_value(config["proxy"])
     config["total_accounts"] = int(config["total_accounts"])
     config["cpa_upload_every_n"] = int(config["cpa_upload_every_n"])
+    config["task_launch_interval_min_seconds"] = max(0, int(config["task_launch_interval_min_seconds"]))
+    config["task_launch_interval_max_seconds"] = max(
+        config["task_launch_interval_min_seconds"],
+        int(config["task_launch_interval_max_seconds"]),
+    )
 
     return config
 
@@ -158,6 +169,14 @@ UPLOAD_API_PROXY = str(_CONFIG.get("upload_api_proxy", "") or "").strip()
 CPA_CLEANUP_ENABLED = _as_bool(_CONFIG.get("cpa_cleanup_enabled", True))
 CPA_UPLOAD_EVERY_N = max(1, int(_CONFIG.get("cpa_upload_every_n", 3) or 3))
 MAIL_PROVIDER = str(_CONFIG.get("mail_provider", "duckmail")).strip().lower()
+BATCH_MODE = str(_CONFIG.get("batch_mode", "pipeline") or "pipeline").strip().lower()
+TASK_LAUNCH_INTERVAL_MIN_SECONDS = max(0, int(_CONFIG.get("task_launch_interval_min_seconds", 1) or 0))
+TASK_LAUNCH_INTERVAL_MAX_SECONDS = max(
+    TASK_LAUNCH_INTERVAL_MIN_SECONDS,
+    int(_CONFIG.get("task_launch_interval_max_seconds", 3) or TASK_LAUNCH_INTERVAL_MIN_SECONDS),
+)
+
+SUPPORTED_MAIL_PROVIDERS = {"tempmail_lol", "lamail"}
 
 # 全局线程锁
 _print_lock = threading.RLock()
@@ -1399,6 +1418,179 @@ def _quick_preflight(proxy: str = None, provider: str = "duckmail") -> bool:
     return all_ok
 
 
+# ================= Task-driven runtime =================
+
+@dataclass
+class MailboxSession:
+    email: str
+    password: str
+    token: str
+    provider: str
+
+
+@dataclass
+class RegistrationTaskResult:
+    idx: int
+    success: bool
+    provider: str
+    email: str = ""
+    email_password: str = ""
+    chatgpt_password: str = ""
+    oauth_ok: bool = False
+    error_message: str = ""
+
+
+class BaseMailboxService:
+    provider: str = ""
+
+    def __init__(self, register_client: "ChatGPTRegister"):
+        self.register_client = register_client
+        self._session: Optional[MailboxSession] = None
+
+    def create_mailbox(self) -> MailboxSession:
+        raise NotImplementedError
+
+    def wait_for_verification_code(self, timeout: int) -> Optional[str]:
+        if not self._session:
+            return None
+        return self.register_client.wait_for_verification_email(
+            self._session.token,
+            timeout=timeout,
+            email=self._session.email,
+            provider=self.provider,
+        )
+
+
+class TempmailLolMailboxService(BaseMailboxService):
+    provider = "tempmail_lol"
+
+    def create_mailbox(self) -> MailboxSession:
+        email, password, token = self.register_client.create_tempmail_lol_email()
+        self._session = MailboxSession(
+            email=email,
+            password=password,
+            token=token,
+            provider=self.provider,
+        )
+        return self._session
+
+
+class LaMailMailboxService(BaseMailboxService):
+    provider = "lamail"
+
+    def create_mailbox(self) -> MailboxSession:
+        email, password, token = self.register_client.create_lamail_email()
+        self._session = MailboxSession(
+            email=email,
+            password=password,
+            token=token,
+            provider=self.provider,
+        )
+        return self._session
+
+
+def _build_mailbox_service(register_client: "ChatGPTRegister", provider: str) -> BaseMailboxService:
+    normalized = str(provider or "").strip().lower()
+    if normalized == "tempmail_lol":
+        return TempmailLolMailboxService(register_client)
+    if normalized == "lamail":
+        return LaMailMailboxService(register_client)
+    raise ValueError(f"不支持的 mail_provider={provider}，当前仅支持 tempmail_lol / lamail")
+
+
+class RegistrationTaskRunner:
+    def __init__(self, idx: int, total: int, proxy: Optional[str], output_file: str):
+        self.idx = idx
+        self.total = total
+        self.proxy = proxy
+        self.output_file = output_file
+
+    def run(self) -> RegistrationTaskResult:
+        reg = ChatGPTRegister(proxy=self.proxy, tag=f"{self.idx}")
+        provider = MAIL_PROVIDER
+        try:
+            mailbox_service = _build_mailbox_service(reg, provider)
+            reg._print(f"[{provider}] 初始化邮箱服务...")
+            mailbox = mailbox_service.create_mailbox()
+            reg.tag = mailbox.email.split("@")[0]
+
+            chatgpt_password = _generate_password()
+            name = _random_name()
+            birthdate = _random_birthdate()
+
+            with _print_lock:
+                print(f"\n{'=' * 60}")
+                print(f"  [{self.idx}/{self.total}] 注册: {mailbox.email}")
+                print(f"  邮箱服务: {provider}")
+                print(f"  ChatGPT密码: {chatgpt_password}")
+                if mailbox.password:
+                    print(f"  邮箱密码: {mailbox.password}")
+                print(f"  姓名: {name} | 生日: {birthdate}")
+                print(f"{'=' * 60}")
+
+            otp_fetcher = mailbox_service.wait_for_verification_code
+            reg.run_register(
+                mailbox.email,
+                chatgpt_password,
+                name,
+                birthdate,
+                mailbox.token,
+                provider=provider,
+                otp_fetcher=otp_fetcher,
+            )
+
+            oauth_ok = True
+            if ENABLE_OAUTH:
+                reg._print("[OAuth] 开始获取 Codex Token...")
+                tokens = reg.perform_codex_oauth_login_http(
+                    mailbox.email,
+                    chatgpt_password,
+                    mail_token=mailbox.token,
+                    provider=provider,
+                    otp_fetcher=otp_fetcher,
+                )
+                oauth_ok = bool(tokens and tokens.get("access_token"))
+                if oauth_ok:
+                    _save_codex_tokens(mailbox.email, tokens)
+                    reg._print("[OAuth] Token 已保存")
+                else:
+                    msg = "OAuth 获取失败"
+                    if OAUTH_REQUIRED:
+                        raise Exception(f"{msg}（oauth_required=true）")
+                    reg._print(f"[OAuth] {msg}（按配置继续）")
+
+            with _file_lock:
+                with open(self.output_file, "a", encoding="utf-8") as out:
+                    line = f"{mailbox.email}----{chatgpt_password}"
+                    if mailbox.password:
+                        line += f"----{mailbox.password}"
+                    line += f"----oauth={'ok' if oauth_ok else 'fail'}\n"
+                    out.write(line)
+
+            with _print_lock:
+                print(f"\n[OK] [{reg.tag}] {mailbox.email} 注册成功!")
+
+            return RegistrationTaskResult(
+                idx=self.idx,
+                success=True,
+                provider=provider,
+                email=mailbox.email,
+                email_password=mailbox.password,
+                chatgpt_password=chatgpt_password,
+                oauth_ok=oauth_ok,
+            )
+        except Exception as error:
+            with _print_lock:
+                print(f"\n[FAIL] [{self.idx}] 注册失败: {error}")
+                traceback.print_exc()
+            return RegistrationTaskResult(
+                idx=self.idx,
+                success=False,
+                provider=provider,
+                error_message=str(error),
+            )
+
+
 # ================= ChatGPTRegister 主类 =================
 
 class ChatGPTRegister:
@@ -2043,7 +2235,16 @@ class ChatGPTRegister:
 
     # ==================== 自动注册主流程 ====================
 
-    def run_register(self, email, password, name, birthdate, mail_token, provider="duckmail"):
+    def run_register(
+        self,
+        email,
+        password,
+        name,
+        birthdate,
+        mail_token,
+        provider="duckmail",
+        otp_fetcher: Optional[Callable[[int], Optional[str]]] = None,
+    ):
         """注册流程，provider 决定验证码收取方式"""
         self.visit_homepage()
         _random_delay(0.3, 0.8)
@@ -2087,8 +2288,12 @@ class ChatGPTRegister:
             need_otp = True
 
         if need_otp:
-            otp_code = self.wait_for_verification_email(
-                mail_token, timeout=120, email=email, provider=provider
+            otp_code = (
+                otp_fetcher(120)
+                if otp_fetcher is not None
+                else self.wait_for_verification_email(
+                    mail_token, timeout=120, email=email, provider=provider
+                )
             )
             if not otp_code:
                 raise Exception("未能获取验证码")
@@ -2099,8 +2304,12 @@ class ChatGPTRegister:
                 self._print("验证码失败，重试...")
                 self.send_otp()
                 _random_delay(1.0, 2.0)
-                otp_code = self.wait_for_verification_email(
-                    mail_token, timeout=60, email=email, provider=provider
+                otp_code = (
+                    otp_fetcher(60)
+                    if otp_fetcher is not None
+                    else self.wait_for_verification_email(
+                        mail_token, timeout=60, email=email, provider=provider
+                    )
                 )
                 if not otp_code:
                     raise Exception("重试后仍未获取验证码")
@@ -2333,8 +2542,14 @@ class ChatGPTRegister:
 
         return None
 
-    def perform_codex_oauth_login_http(self, email: str, password: str, mail_token: str = None,
-                                        provider: str = "duckmail"):
+    def perform_codex_oauth_login_http(
+        self,
+        email: str,
+        password: str,
+        mail_token: str = None,
+        provider: str = "duckmail",
+        otp_fetcher: Optional[Callable[[int], Optional[str]]] = None,
+    ):
         self._print("[OAuth] 开始执行 Codex OAuth 纯协议流程...")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
@@ -2508,6 +2723,10 @@ class ChatGPTRegister:
             while time.time() < otp_deadline and not otp_success:
                 # 根据 provider 选择邮件拉取方式
                 candidate_codes = []
+                if otp_fetcher is not None:
+                    fetched = otp_fetcher(max(1, int(otp_deadline - time.time())))
+                    if fetched and fetched not in tried_codes:
+                        candidate_codes.append(fetched)
                 if provider == "cfmail":
                     messages = self._fetch_emails_cfmail(mail_token)
                     for msg in messages[:12]:
@@ -2532,7 +2751,7 @@ class ChatGPTRegister:
                             if m and m.group(1) not in tried_codes:
                                 candidate_codes.append(m.group(1))
                                 break
-                elif provider == "tempmail_lol":
+                elif provider == "tempmail_lol" and otp_fetcher is None:
                     messages = self._fetch_emails_tempmail_lol(mail_token) or []
                     for msg in messages[:20]:
                         content = " ".join([
@@ -2546,7 +2765,7 @@ class ChatGPTRegister:
                         code = self._extract_verification_code(content)
                         if code and code not in tried_codes:
                             candidate_codes.append(code)
-                elif provider == "lamail":
+                elif provider == "lamail" and otp_fetcher is None:
                     messages = self._fetch_emails_lamail(mail_token, email) or []
                     for msg in messages[:20]:
                         msg_id = str(msg.get("id") or "").strip()
@@ -2568,7 +2787,7 @@ class ChatGPTRegister:
                         code = self._extract_verification_code(content)
                         if code and code not in tried_codes:
                             candidate_codes.append(code)
-                else:
+                elif otp_fetcher is None:
                     messages = self._fetch_emails_duckmail(mail_token) or []
                     for msg in messages[:12]:
                         msg_id = msg.get("id") or msg.get("@id")
@@ -2693,84 +2912,14 @@ class ChatGPTRegister:
     # ==================== 并发批量注册 ====================
 
 def _register_one(idx, total, proxy, output_file):
-    """单个注册任务，根据 MAIL_PROVIDER 选择邮箱服务"""
-    reg = None
-    try:
-        reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
-        provider = MAIL_PROVIDER
-
-        # 根据邮箱服务创建临时邮箱
-        if provider == "cfmail":
-            reg._print("[cfmail] 创建 CF 自建邮箱...")
-            email, email_pwd, mail_token = reg.create_cfmail_email()
-        elif provider == "tempmail_lol":
-            reg._print("[tempmail_lol] 创建临时邮箱...")
-            email, email_pwd, mail_token = reg.create_tempmail_lol_email()
-        elif provider == "lamail":
-            reg._print("[lamail] 创建临时邮箱...")
-            email, email_pwd, mail_token = reg.create_lamail_email()
-        else:
-            reg._print("[DuckMail] 创建临时邮箱...")
-            if not DUCKMAIL_BEARER:
-                raise Exception("DUCKMAIL_BEARER 未设置，请在 config.json 中配置或改用 cfmail/lamail/tempmail_lol")
-            email, email_pwd, mail_token = reg.create_temp_email()
-
-        tag = email.split("@")[0]
-        reg.tag = tag
-
-        chatgpt_password = _generate_password()
-        name = _random_name()
-        birthdate = _random_birthdate()
-
-        with _print_lock:
-            print(f"\n{'=' * 60}")
-            print(f"  [{idx}/{total}] 注册: {email}")
-            print(f"  邮箱服务: {provider}")
-            print(f"  ChatGPT密码: {chatgpt_password}")
-            if email_pwd:
-                print(f"  邮箱密码: {email_pwd}")
-            print(f"  姓名: {name} | 生日: {birthdate}")
-            print(f"{'=' * 60}")
-
-        # 执行注册流程
-        reg.run_register(email, chatgpt_password, name, birthdate, mail_token, provider=provider)
-
-        # OAuth（可选）
-        oauth_ok = True
-        if ENABLE_OAUTH:
-            reg._print("[OAuth] 开始获取 Codex Token...")
-            tokens = reg.perform_codex_oauth_login_http(
-                email, chatgpt_password, mail_token=mail_token, provider=provider
-            )
-            oauth_ok = bool(tokens and tokens.get("access_token"))
-            if oauth_ok:
-                _save_codex_tokens(email, tokens)
-                reg._print("[OAuth] Token 已保存")
-            else:
-                msg = "OAuth 获取失败"
-                if OAUTH_REQUIRED:
-                    raise Exception(f"{msg}（oauth_required=true）")
-                reg._print(f"[OAuth] {msg}（按配置继续）")
-
-        # 线程安全写入结果
-        with _file_lock:
-            with open(output_file, "a", encoding="utf-8") as out:
-                line = f"{email}----{chatgpt_password}"
-                if email_pwd:
-                    line += f"----{email_pwd}"
-                line += f"----oauth={'ok' if oauth_ok else 'fail'}\n"
-                out.write(line)
-
-        with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
-        return True, email, None
-
-    except Exception as e:
-        error_msg = str(e)
-        with _print_lock:
-            print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
-            traceback.print_exc()
-        return False, None, error_msg
+    """单个注册任务，使用轻量任务驱动运行器执行业务流程。"""
+    result = RegistrationTaskRunner(
+        idx=idx,
+        total=total,
+        proxy=proxy,
+        output_file=output_file,
+    ).run()
+    return result.success, result.email or None, result.error_message or None
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
               max_workers=3, proxy=None, cpa_cleanup=None, cpa_upload_every_n: int = 3):
@@ -2778,33 +2927,18 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     provider = MAIL_PROVIDER
 
     # 检查邮箱服务配置
-    if provider == "cfmail":
-        if not CFMAIL_ACCOUNTS:
-            print(f"❌ 错误: mail_provider=cfmail 但未找到可用的 cfmail 配置")
-            print(f"   请检查配置文件: {_CFMAIL_CONFIG_PATH}")
-            return
-    elif provider == "duckmail":
-        if not DUCKMAIL_BEARER:
-            print("❌ 错误: mail_provider=duckmail 但未设置 DUCKMAIL_BEARER")
-            print("   请在 config.json 中设置 duckmail_bearer，或将 mail_provider 改为 cfmail/lamail/tempmail_lol")
-            return
-    elif provider not in {"tempmail_lol", "lamail"}:
+    if provider not in SUPPORTED_MAIL_PROVIDERS:
         print(f"❌ 错误: 不支持的 mail_provider={provider}")
-        print("   可选值: duckmail / cfmail / lamail / tempmail_lol")
+        print("   可选值: lamail / tempmail_lol")
         return
 
     actual_workers = min(max_workers, total_accounts)
     print(f"\n{'#' * 60}")
     print(f"  ChatGPT 批量自动注册")
     print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
+    print(f"  批量模式: {BATCH_MODE}")
     print(f"  邮箱服务: {provider}")
-    if provider == "cfmail":
-        cfmail_names = ", ".join(a.name for a in CFMAIL_ACCOUNTS)
-        print(f"  cfmail 配置: {cfmail_names}")
-        print(f"  cfmail 模式: {CFMAIL_PROFILE_MODE}")
-    elif provider == "duckmail":
-        print(f"  DuckMail: {DUCKMAIL_API_BASE}")
-    elif provider == "tempmail_lol":
+    if provider == "tempmail_lol":
         print(f"  TempMail.lol: {TEMPMAIL_LOL_API_BASE}")
     elif provider == "lamail":
         print(f"  LaMail: {LAMAIL_API_BASE}")
@@ -2833,32 +2967,42 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     _render_apt_like_progress(completed_count, total_accounts, success_count, fail_count, start_time)
 
     with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-        futures = {}
-        for idx in range(1, total_accounts + 1):
-            future = executor.submit(_register_one, idx, total_accounts, proxy, output_file)
-            futures[future] = idx
+        pending_indexes = list(range(1, total_accounts + 1))
+        active_futures = {}
 
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                ok, email, err = future.result()
-                if ok:
-                    success_count += 1
-                    since_last_upload += 1
-                    if UPLOAD_API_URL and since_last_upload >= upload_every_n:
-                        print(f"\n[CPA] 达到分批上传阈值: {since_last_upload}/{upload_every_n}，开始上传...")
-                        _upload_all_tokens_to_cpa()
-                        since_last_upload = 0
-                else:
+        while pending_indexes or active_futures:
+            while pending_indexes and len(active_futures) < actual_workers:
+                idx = pending_indexes.pop(0)
+                future = executor.submit(_register_one, idx, total_accounts, proxy, output_file)
+                active_futures[future] = idx
+                if BATCH_MODE == "pipeline" and pending_indexes:
+                    time.sleep(random.uniform(
+                        TASK_LAUNCH_INTERVAL_MIN_SECONDS,
+                        TASK_LAUNCH_INTERVAL_MAX_SECONDS,
+                    ))
+
+            done, _ = wait(list(active_futures.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                idx = active_futures.pop(future)
+                try:
+                    ok, email, err = future.result()
+                    if ok:
+                        success_count += 1
+                        since_last_upload += 1
+                        if UPLOAD_API_URL and since_last_upload >= upload_every_n:
+                            print(f"\n[CPA] 达到分批上传阈值: {since_last_upload}/{upload_every_n}，开始上传...")
+                            _upload_all_tokens_to_cpa()
+                            since_last_upload = 0
+                    else:
+                        fail_count += 1
+                        print(f"  [账号 {idx}] 失败: {err}")
+                except Exception as e:
                     fail_count += 1
-                    print(f"  [账号 {idx}] 失败: {err}")
-            except Exception as e:
-                fail_count += 1
-                with _print_lock:
-                    print(f"[FAIL] 账号 {idx} 线程异常: {e}")
-            finally:
-                completed_count += 1
-                _render_apt_like_progress(completed_count, total_accounts, success_count, fail_count, start_time)
+                    with _print_lock:
+                        print(f"[FAIL] 账号 {idx} 线程异常: {e}")
+                finally:
+                    completed_count += 1
+                    _render_apt_like_progress(completed_count, total_accounts, success_count, fail_count, start_time)
 
     # 结束进度条占用行
     with _print_lock:
@@ -2888,23 +3032,7 @@ def main():
     provider = MAIL_PROVIDER
 
     # 检查配置
-    if provider == "cfmail":
-        if not CFMAIL_ACCOUNTS:
-            print(f"\n⚠️  警告: mail_provider=cfmail 但未找到可用配置")
-            print(f"   配置文件: {_CFMAIL_CONFIG_PATH}")
-            print(f"   请参考 zhuce5_cfmail_accounts.json 格式补充配置")
-            print("\n   按 Enter 继续尝试运行 (可能会失败)...")
-            input()
-        else:
-            cfmail_names = ", ".join(a.name for a in CFMAIL_ACCOUNTS)
-            print(f"\n[Info] cfmail 配置已加载: {cfmail_names}")
-    elif provider == "duckmail":
-        if not DUCKMAIL_BEARER:
-            print("\n⚠️  警告: 未设置 DUCKMAIL_BEARER")
-            print("   请编辑 config.json 设置 duckmail_bearer，或将 mail_provider 改为 cfmail/lamail/tempmail_lol")
-            print("\n   按 Enter 继续尝试运行 (可能会失败)...")
-            input()
-    elif provider == "tempmail_lol":
+    if provider == "tempmail_lol":
         print(f"\n[Info] TempMail.lol 已启用: {TEMPMAIL_LOL_API_BASE}")
     elif provider == "lamail":
         print(f"\n[Info] LaMail 已启用: {LAMAIL_API_BASE}")
@@ -2916,7 +3044,7 @@ def main():
             print("[Info] LaMail API Key: 未配置（将使用匿名临时邮箱能力）")
     else:
         print(f"\n❌ 错误: 不支持的 mail_provider={provider}")
-        print("   可选值: duckmail / cfmail / lamail / tempmail_lol")
+        print("   可选值: lamail / tempmail_lol")
         return
 
     # 代理配置
