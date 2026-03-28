@@ -11,6 +11,8 @@ fake_curl_cffi.requests = types.SimpleNamespace()
 sys.modules.setdefault("curl_cffi", fake_curl_cffi)
 
 import ncs_register
+import ncs_register_legacy
+from ncs_runtime import email_services, engine as runtime_engine
 
 
 class ProxyNormalizationTests(unittest.TestCase):
@@ -62,6 +64,42 @@ class ProxyNormalizationTests(unittest.TestCase):
         self.assertEqual(config["upload_api_url"], "https://upload.example.com")
         self.assertEqual(config["upload_api_token"], "upload-token")
 
+    def test_auto_scheduler_build_register_input_matches_cli_prompt_order(self):
+        cfg = {
+            "proxy": "",
+            "upload_api_url": "http://example.invalid/v0/management/auth-files",
+        }
+        params = {
+            "proxy": "",
+            "preflight": "n",
+            "output_file": "registered_accounts.txt",
+            "total_accounts": 200,
+            "max_workers": 3,
+            "cpa_cleanup": "n",
+            "cpa_upload_every_n": 3,
+        }
+        with mock.patch.dict("os.environ", {
+            "HTTPS_PROXY": "",
+            "https_proxy": "",
+            "ALL_PROXY": "",
+            "all_proxy": "",
+        }, clear=False):
+            stdin_input = auto_scheduler.build_register_input(params, cfg)
+        self.assertEqual(
+            stdin_input,
+            "\nn\nregistered_accounts.txt\n200\n3\nn\n3\n",
+        )
+
+    def test_cpa_root_url_normalizes_to_management_auth_files(self):
+        self.assertEqual(
+            auto_scheduler._cpa_auth_files_url("http://example.com:8317"),
+            "http://example.com:8317/v0/management/auth-files",
+        )
+        self.assertEqual(
+            ncs_register_legacy._cpa_normalize_api_root("http://example.com:8317"),
+            "http://example.com:8317/v0/management",
+        )
+
     def test_auto_scheduler_main_runs_once_without_sleep(self):
         with mock.patch("auto_scheduler._load_account_count_config", return_value={}):
             with mock.patch("auto_scheduler.count_valid_accounts_local", return_value=999):
@@ -102,6 +140,8 @@ class ProxyNormalizationTests(unittest.TestCase):
     def test_scheduler_workflow_includes_cpa_dns_diagnostics(self):
         workflow = Path(".github/workflows/scheduler.yml").read_text(encoding="utf-8")
         self.assertIn("Diagnose CPA DNS", workflow)
+        self.assertIn("LAMAIL_DOMAIN", workflow)
+        self.assertIn("LAMAIL_API_KEY", workflow)
 
     def test_mailbox_service_factory_supports_lamail_and_tempmail_only(self):
         fake_register = object()
@@ -115,6 +155,21 @@ class ProxyNormalizationTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ncs_register._build_mailbox_service(fake_register, "duckmail")
+
+    def test_tempmail_rate_limit_falls_back_to_lamail(self):
+        register_client = mock.Mock()
+        register_client.create_tempmail_lol_email.side_effect = Exception(
+            'TempMail.lol 创建失败: 429 - {"error":"Rate limited (free)"}'
+        )
+        register_client.create_lamail_email.return_value = ("fallback@example.com", "", "token-1")
+        register_client._print = mock.Mock()
+
+        engine = runtime_engine.RegistrationEngine(idx=1, total=1, proxy=None, output_file="out.txt")
+        service, mailbox, provider = engine._create_mailbox_with_fallback(register_client, "tempmail_lol")
+
+        self.assertIsInstance(service, email_services.LaMailMailboxService)
+        self.assertEqual(provider, "lamail")
+        self.assertEqual(mailbox.email, "fallback@example.com")
 
     def test_load_config_supports_batch_runtime_defaults(self):
         fake_config = {
