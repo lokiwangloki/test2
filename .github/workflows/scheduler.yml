@@ -2,7 +2,7 @@ name: Hourly Auto Scheduler
 
 on:
   schedule:
-    - cron: '7 * * * *'  # 每小时错峰执行，避开整点高峰
+    - cron: '11 * * * *'  # 每小时固定错峰执行，避开整点高峰
   workflow_dispatch: {}
 
 concurrency:
