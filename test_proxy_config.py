@@ -73,7 +73,7 @@ class ProxyNormalizationTests(unittest.TestCase):
             "proxy": "",
             "preflight": "n",
             "output_file": "registered_accounts.txt",
-            "total_accounts": 200,
+            "total_accounts": 500,
             "max_workers": 3,
             "cpa_cleanup": "n",
             "cpa_upload_every_n": 3,
@@ -87,8 +87,12 @@ class ProxyNormalizationTests(unittest.TestCase):
             stdin_input = auto_scheduler.build_register_input(params, cfg)
         self.assertEqual(
             stdin_input,
-            "\nn\nregistered_accounts.txt\n200\n3\nn\n3\n",
+            "\nn\nregistered_accounts.txt\n500\n3\nn\n3\n",
         )
+
+    def test_auto_scheduler_defaults_target_500_accounts(self):
+        self.assertEqual(auto_scheduler.ACCOUNT_THRESHOLD, 500)
+        self.assertEqual(auto_scheduler.AUTO_PARAMS["total_accounts"], 500)
 
     def test_cpa_root_url_normalizes_to_management_auth_files(self):
         self.assertEqual(
